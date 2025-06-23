@@ -1,2 +1,1 @@
-# audience-manager-platform
-audience-manager-platform
+Audience Manager Platform
