@@ -3,6 +3,7 @@ from flask import request, jsonify
 from datetime import datetime
 from ..models.rule_engine import SegmentCatalog, db
 from . import api_bp
+import json
 
 @api_bp.route('/segments', methods=['GET'])
 def list_segments():
@@ -114,3 +115,60 @@ def get_segment_sample_data(segment_id):
             'status': 'error',
             'message': str(e)
         }), 404
+
+@api_bp.route('/segments/<int:segment_id>/lineage', methods=['GET'])
+def get_segment_lineage(segment_id):
+    """Get segment lineage for visualization"""
+    try:
+        nodes = []
+        edges = []
+        visited = set()
+
+        def build_lineage(current_segment_id):
+            if current_segment_id in visited:
+                return
+            visited.add(current_segment_id)
+
+            segment = SegmentCatalog.query.get(current_segment_id)
+            if not segment:
+                return
+
+            nodes.append({
+                'id': str(segment.id),
+                'data': { 'label': segment.segment_name },
+                'position': { 'x': 0, 'y': 0 }  # Placeholder position
+            })
+
+            if segment.depends_on:
+                try:
+                    parent_rule_ids = json.loads(segment.depends_on)
+                    for parent_rule_id in parent_rule_ids:
+                        parent_segment = SegmentCatalog.query.filter_by(rule_id=parent_rule_id).first()
+                        if parent_segment:
+                            edges.append({
+                                'id': f'e{parent_segment.id}-{segment.id}',
+                                'source': str(parent_segment.id),
+                                'target': str(segment.id)
+                            })
+                            build_lineage(parent_segment.id)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        build_lineage(segment_id)
+
+        # A simple layout algorithm
+        for i, node in enumerate(nodes):
+            node['position'] = {'x': i * 250, 'y': 100}
+
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'nodes': nodes,
+                'edges': edges
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500

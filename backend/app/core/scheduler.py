@@ -69,27 +69,8 @@ def execute_rule(rule_id: int):
         try:
             logger.info(f"Executing rule {rule_id}")
 
-            # --- START: Dynamic Spark Path Logic ---
-            spark_home_env = os.environ.get('SPARK_HOME')
-            possible_paths = [
-                os.path.join(spark_home_env, 'bin', 'spark-submit') if spark_home_env else None,
-                '/opt/spark-3.5/bin/spark-submit',
-                '/opt/homebrew/Cellar/apache-spark/4.0.0/libexec/bin/spark-submit',
-                '/opt/homebrew/bin/spark-submit',
-            ]
-
-            spark_submit_cmd = None
-            for path in possible_paths:
-                if path and os.path.isfile(path) and os.access(path, os.X_OK):
-                    spark_submit_cmd = path
-                    logger.info(f"Found spark-submit executable at: {spark_submit_cmd}")
-                    break
-            
-            if not spark_submit_cmd:
-                logger.error("Could not find a valid spark-submit executable. Searched paths: " + str([p for p in possible_paths if p]))
-                logger.error("Please ensure SPARK_HOME is set correctly or Spark is in a standard location.")
-                return False
-            # --- END: Dynamic Spark Path Logic ---
+            # Use 'spark-submit' and assume it's in the PATH. The environment will be configured below.
+            spark_submit_cmd = "spark-submit"
 
             # Construct absolute path to the Spark job script
             app_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -118,8 +99,13 @@ def execute_rule(rule_id: int):
 
             logger.debug(f"Running command: {' '.join(cmd)}")
 
-            # Set PYTHONPATH for the Spark job to find the 'app' module
+            # Set environment variables for the Spark job
             env = os.environ.copy()
+
+            # Set SPARK_HOME to the correct path provided by the user.
+            spark_home = '/opt/spark-3.5'
+            env['SPARK_HOME'] = spark_home
+            logger.info(f"Explicitly setting SPARK_HOME for subprocess: {spark_home}")
             python_path = env.get('PYTHONPATH', '')
             # The project root is 'backend_dir', which is two levels up from this file's directory.
             env['PYTHONPATH'] = f"{backend_dir}:{python_path}" if python_path else backend_dir

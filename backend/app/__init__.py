@@ -35,7 +35,7 @@ def create_app(config_name='default'):
         app.register_blueprint(api_bp, url_prefix='/api/v1')
         
         # Initialize scheduler in non-testing environments
-        if not app.config.get('TESTING'):
+        if not app.config.get('TESTING') and not IS_MIGRATING:
             try:
                 init_scheduler(app)
             except Exception as e:

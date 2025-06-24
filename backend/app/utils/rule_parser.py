@@ -1,58 +1,118 @@
 # app/utils/rule_parser.py
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 class RuleParser:
     """
-    Parses rule conditions and generates the corresponding SQL query for segment creation.
+    Parses rule conditions from a list of condition objects and generates an efficient SQL query.
     """
 
+    FIELD_TO_COLUMN_MAP = {
+        'transaction_amount': 'amount',
+        'city_tier': 'city_tier',
+        'transaction_date': 'transaction_date',
+        'total_spend': 'total_spent',
+        'transaction_count': 'total_transactions'
+    }
+
+    AGGREGATE_FIELDS = ['total_spend', 'transaction_count']
+
     @staticmethod
-    def generate_segment_sql(rule_id: int, conditions: Dict[str, Any]) -> str:
+    def _parse_to_clauses(conditions: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
         """
-        Generates a SQL query to create a user segment based on a set of conditions.
-        This query aggregates data from both UPI and Credit Card transaction tables.
+        Parses a list of condition objects into WHERE and HAVING clauses.
 
         Args:
-            rule_id: The ID of the rule.
-            conditions: A dictionary defining the filtering conditions.
+            conditions: A list of dictionaries, each defining a filtering condition.
 
         Returns:
-            A string containing the generated SQL query.
+            A tuple containing two lists: where_conditions and having_conditions.
+        """
+        where_conditions = []
+        having_conditions = []
+
+        if not isinstance(conditions, list):
+            logger.warning(f"Conditions format is not a list: {conditions}")
+            return [], []
+
+        for condition in conditions:
+            field = condition.get('field')
+            operator = condition.get('operator')
+            value = condition.get('value')
+            value2 = condition.get('value2')
+
+            if not all([field, operator, value is not None]):
+                logger.warning(f"Skipping malformed condition: {condition}")
+                continue
+
+            allowed_operators = ['>', '<', '=', '>=', '<=', '!=', 'IN', 'NOT IN', 'BETWEEN']
+            if operator.upper() not in allowed_operators:
+                logger.warning(f"Skipping condition with invalid operator: {operator}")
+                continue
+
+            column_name = RuleParser.FIELD_TO_COLUMN_MAP.get(field)
+            if not column_name:
+                logger.warning(f"Skipping condition with unknown field: {field}")
+                continue
+            
+            clause = ""
+            if operator.upper() == 'BETWEEN':
+                if value2 is None:
+                    logger.warning(f"Skipping BETWEEN operator with missing second value: {condition}")
+                    continue
+                sql_value1 = f"'{value}'"
+                sql_value2 = f"'{value2}'"
+                clause = f"{column_name} BETWEEN {sql_value1} AND {sql_value2}"
+            else:
+                sql_value = f"'{value}'" if isinstance(value, str) else str(value)
+                if operator.upper() in ['IN', 'NOT IN']:
+                    if isinstance(value, list) and value:
+                        formatted_values = []
+                        for v in value:
+                            if isinstance(v, (int, float)):
+                                formatted_values.append(str(v))
+                            else:
+                                formatted_values.append(f"'{v}'")
+                        sql_value = f"({', '.join(formatted_values)})"
+                    else:
+                        logger.warning(f"Skipping IN/NOT IN operator with non-list or empty value: {value}")
+                        continue
+                
+                clause = f"{column_name} {operator.upper()} {sql_value}"
+
+            if field in RuleParser.AGGREGATE_FIELDS:
+                if field == 'total_spend':
+                    clause = f"SUM(amount) {operator.upper()} {sql_value}"
+                elif field == 'transaction_count':
+                    clause = f"COUNT(user_id) {operator.upper()} {sql_value}"
+                having_conditions.append(clause)
+            else:
+                where_conditions.append(clause)
+
+        return where_conditions, having_conditions
+
+    @staticmethod
+    def generate_segment_sql(rule_id: int, conditions: List[Dict[str, Any]]) -> str:
+        """
+        Generates an efficient SQL query to create a user segment.
         """
         logger.info(f"Generating SQL for Rule ID: {rule_id} with conditions: {conditions}")
 
         base_query = """
         WITH all_transactions AS (
-            SELECT 
-                user_id,
-                amount,
-                transaction_date,
-                category,
-                city_tier,
-                'UPI' as transaction_type
+            SELECT user_id, amount, transaction_date, category, city_tier, 'UPI' as transaction_type
             FROM upi_transactions_raw
-            
             UNION ALL
-            
-            SELECT 
-                user_id,
-                amount,
-                transaction_date,
-                category,
-                city_tier,
-                'CREDIT_CARD' as transaction_type
+            SELECT user_id, amount, transaction_date, category, city_tier, 'CREDIT_CARD' as transaction_type
             FROM credit_card_transactions_raw
         ),
-        
         filtered_transactions AS (
             SELECT *
             FROM all_transactions
             {where_clause}
         )
-
         SELECT
             ft.user_id,
             COUNT(ft.user_id) as total_transactions,
@@ -63,153 +123,14 @@ class RuleParser:
         {having_clause}
         """
 
-        where_conditions = []
-        having_conditions = []
-
-        # Timeframe conditions (e.g., last 30 days)
-        if 'timeframe_days' in conditions:
-            where_conditions.append(f"transaction_date >= date('now', '-{int(conditions['timeframe_days'])} days')")
-
-        # Transaction amount threshold (applied to individual transactions)
-        if conditions.get('type') == 'transaction_amount' and 'value' in conditions and 'operator' in conditions:
-             where_conditions.append(f"amount {conditions['operator']} {float(conditions['value'])}")
-        
-        # City Tier filter
-        if 'city_tier_in' in conditions and conditions['city_tier_in']:
-            tiers = ', '.join([f"'{tier}'" for tier in conditions['city_tier_in']])
-            where_conditions.append(f"city_tier IN ({tiers})")
-            
-        # Total Spend threshold (applied after aggregation)
-        if 'total_spend_gt' in conditions:
-            having_conditions.append(f"SUM(amount) > {float(conditions['total_spend_gt'])}")
-        
-        if 'total_spend_lt' in conditions:
-            having_conditions.append(f"SUM(amount) < {float(conditions['total_spend_lt'])}")
-
-        # Transaction count threshold (applied after aggregation)
-        if 'transaction_count_gt' in conditions:
-            having_conditions.append(f"COUNT(user_id) > {int(conditions['transaction_count_gt'])}")
-            
-        if 'transaction_count_lt' in conditions:
-            having_conditions.append(f"COUNT(user_id) < {int(conditions['transaction_count_lt'])}")
-
+        where_conditions, having_conditions = RuleParser._parse_to_clauses(conditions)
 
         where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
         having_clause = f"HAVING {' AND '.join(having_conditions)}" if having_conditions else ""
-        
+
         final_sql = base_query.format(where_clause=where_clause, having_clause=having_clause)
-        
-        # Clean up whitespace and newlines
         final_sql = " ".join(final_sql.strip().split())
-        
+
         logger.debug(f"Generated SQL for Rule ID {rule_id}: {final_sql}")
-        
+
         return final_sql
-
-from datetime import datetime, timedelta
-from typing import Dict, Any, List
-
-class RuleParser:
-    @staticmethod
-    def parse_conditions(conditions: Any) -> str:
-        """Convert UI filter conditions to SQL WHERE clause"""
-        where_clauses = []
-        
-        if isinstance(conditions, list):
-            # New format from dynamic UI: list of condition dicts
-            raw_conditions = [
-                cond for cond in conditions
-                if cond.get('field') in ['start_date', 'end_date', 'city_tier', 'transaction_type', 'amount']
-            ]
-            for cond in raw_conditions:
-                field = cond['field']
-                operator = cond.get('operator', '=') # Default operator
-                value = cond['value']
-
-                if field == 'start_date':
-                    where_clauses.append(f"transaction_date >= '{value}'")
-                elif field == 'end_date':
-                    where_clauses.append(f"transaction_date <= '{value}'")
-                else:
-                    sql_value = f"'{value}'" if isinstance(value, str) else value
-                    where_clauses.append(f"{field} {operator} {sql_value}")
-
-        elif isinstance(conditions, dict):
-            # Legacy format: flat dictionary
-            if conditions.get('start_date') or conditions.get('end_date'):
-                date_conditions = []
-                if conditions.get('start_date'):
-                    date_conditions.append(f"transaction_date >= '{conditions['start_date']}'")
-                if conditions.get('end_date'):
-                    date_conditions.append(f"transaction_date <= '{conditions['end_date']}'")
-                where_clauses.append(f"({' AND '.join(date_conditions)})")
-
-            if conditions.get('city_tier'):
-                where_clauses.append(f"city_tier = {conditions['city_tier']}")
-
-            transaction_type = conditions.get('transaction_type', 'all')
-            if transaction_type != 'all':
-                where_clauses.append(f"transaction_type = '{transaction_type.upper()}'")
-
-            if conditions.get('amount') is not None:
-                operator = conditions.get('amount_operator', '=')
-                where_clauses.append(f"amount {operator} {conditions['amount']}")
-        
-        return " AND ".join(where_clauses) if where_clauses else "1=1"
-    
-    @staticmethod
-    def generate_segment_sql(rule_id: int, conditions: Any) -> str:
-        """Generate SQL to create a segment based on rule conditions"""
-        where_clause = RuleParser.parse_conditions(conditions)
-        
-        sql = f"""
-        WITH user_transactions AS (
-            -- UPI Transactions
-            SELECT 
-                user_id,
-                COUNT(*) as transaction_count,
-                SUM(amount) as total_amount,
-                'UPI' as transaction_type
-            FROM upi_transactions_raw
-            WHERE {where_clause}
-            GROUP BY user_id
-            
-            UNION ALL
-            
-            -- Credit Card Transactions
-            SELECT 
-                user_id,
-                COUNT(*) as transaction_count,
-                SUM(amount) as total_amount,
-                'CREDIT_CARD' as transaction_type
-            FROM credit_card_transactions_raw
-            WHERE {where_clause}
-            GROUP BY user_id
-        )
-        SELECT 
-            user_id,
-            COUNT(*) as total_transactions,
-            SUM(total_amount) as total_spent,
-            (
-                SELECT GROUP_CONCAT(t2.transaction_type, ',')
-                FROM (SELECT DISTINCT user_id, transaction_type FROM user_transactions) t2
-                WHERE t2.user_id = user_transactions.user_id
-            ) as transaction_types
-        FROM user_transactions
-        GROUP BY user_id
-        """
-        
-        # Add transaction count filter if specified
-        min_transactions = None
-        if isinstance(conditions, list):
-            for cond in conditions:
-                if cond.get('field') == 'min_transactions':
-                    min_transactions = cond.get('value')
-                    break
-        elif isinstance(conditions, dict):
-            min_transactions = conditions.get('min_transactions')
-
-        if min_transactions:
-            sql += f" HAVING COUNT(*) >= {min_transactions}"
-        
-        return sql

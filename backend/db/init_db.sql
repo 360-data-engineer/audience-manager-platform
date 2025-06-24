@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS rule_table (
     rule_name TEXT NOT NULL UNIQUE,
     description TEXT,
     conditions JSON NOT NULL,
+    dependencies JSON,
+    operation TEXT,
     segment_id INTEGER,
     is_active BOOLEAN DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
